@@ -1,5 +1,6 @@
 import os
 import shutil
+import zipfile
 import xml.etree.ElementTree as ET
 import cv2
 import numba
@@ -8,6 +9,8 @@ from numpy.typing import NDArray
 from cv2.typing import MatLike
 from collections.abc import Callable
 from typing import List, Dict, Tuple, Optional, Literal
+from timeit import default_timer as timer
+
 
 SALMON = 0
 MEDIUM = 1
@@ -434,7 +437,7 @@ def procesar_poligonos(segmentations: List[Dict[str, int | NDArray[np.float32]]]
     Tiene formato [{'class_id': int, 'points': NDArray[np.float32] de forma (N, 2)}, ...].
     """
     nuevos_poligonos = []
-    metric_name_list = ["area", "perimeter", "elongation", "nitidez"]
+    metric_name_list = ["area", "perimeter", "aspect_ratio", "nitidez"]
 
     # En caso de querer calcularse la nitidez, es necesario pasar la imagen original.
     if image is not None:
@@ -470,7 +473,7 @@ def procesar_poligonos(segmentations: List[Dict[str, int | NDArray[np.float32]]]
 
     return nuevos_poligonos     
 
-def filtrar_dataset(labels_path: str, filtered_path: str, images_path: str, use_nitidez=True, include=False):
+def filtrar_dataset(labels_path: str, filtered_path: str, images_path: str, use_nitidez=True, include=False) -> None:
     """Esta función filtra un dataset de segmentación de instancias en formato YOLO.
     
     Se utilizan métricas y componentes de las distintas etiquetas que se encuentran en el dataset (segmentaciones)
@@ -486,7 +489,7 @@ def filtrar_dataset(labels_path: str, filtered_path: str, images_path: str, use_
     # Se usan siempre estas dimensiones para calcular las métricas, ya que se quieren tresholds "normalizados" a 640x640
     img_height, img_width = 640, 640
     ksizes = (-1, None, 5)
-    peso_borde = 0.3
+    peso_borde = 0.15
 
     for sub in subfolders:
         label_subdir = os.path.join(labels_path, sub)
@@ -527,17 +530,67 @@ def filtrar_dataset(labels_path: str, filtered_path: str, images_path: str, use_
                 filtered_label_path = os.path.join(filtered_subdir, os.path.splitext(label_file)[0] + ".txt")
                 save_yolo_segmentation(filtered_labels, filtered_label_path)
 
-def crear_import(labels_path: str, import_folder: str):
-    #data/images/Test/1329_png_jpg.rf.f715ebcaae86769a5976a38b3e15e9cc.jpg
-    #data/images/Test/1977_png_jpg.rf.d3863d4a22ddda48662bc16e8cd232a1.jpg
+
+# ?
+# ? Crear el archivo ZIP que puede importarse a CVAT
+# ?
+def folder_to_zip(folder_path: str) -> None:
+    """Comprime una carpeta en un archivo ZIP, lo mueve al directorio padre y elimina la carpeta original.
+
+    El archivo ZIP tendrá el mismo nombre que la carpeta, con extensión `.zip`, y contendrá todos los archivos
+    y subcarpetas de la carpeta original, preservando su estructura interna.
+
+    :param str folder_path: Ruta absoluta o relativa de la carpeta a comprimir.
+    :raises FileNotFoundError: Si la carpeta especificada no existe.
+    :raises PermissionError: Si no se tienen permisos para leer la carpeta, escribir el ZIP o eliminar la carpeta.
+    :return None: No retorna ningún valor.
+    """
+    # Obtener el nombre de la carpeta y el directorio padre
+    folder_name = os.path.basename(folder_path)
+    parent_dir = os.path.dirname(folder_path)
+    
+    # Nombre del archivo ZIP (mismo nombre que la carpeta)
+    zip_path = os.path.join(parent_dir, f"{folder_name}.zip")
+    
+    # Crear el archivo ZIP
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        # Recorrer todos los archivos y subcarpetas dentro de la carpeta
+        for root, _, files in os.walk(folder_path):
+            for file in files:
+                file_path = os.path.join(root, file)
+                # Calcular la ruta relativa para mantener la estructura dentro del ZIP
+                relative_path = os.path.relpath(file_path, folder_path)
+                # Agregar el archivo al ZIP
+                zipf.write(file_path, relative_path)
+    
+    # Mover el archivo ZIP al directorio padre (si no está ya ahí)
+    final_zip_path = os.path.join(parent_dir, f"{folder_name}.zip")
+    if zip_path != final_zip_path:
+        shutil.move(zip_path, final_zip_path)
+    
+    # Eliminar la carpeta original
+    shutil.rmtree(folder_path)
+    
+    print(f"Carpeta '{folder_path}' comprimida en '{final_zip_path}' y eliminada.")
+
+def crear_import(labels_path: str, import_folder: str) -> None:
+    """Crea una estructura de directorios y archivos para importar un dataset YOLO a CVAT, y lo comprime en un archivo ZIP.
+
+    :param str labels_path: Directorio que contiene las subcarpetas "test", "train", "valid" con archivos de etiquetas YOLO.
+    :param str import_folder: Directorio donde se creará la estructura de importación.
+    :raises FileNotFoundError: Si `labels_path` o sus subcarpetas no existen.
+    :raises PermissionError: Si no se tienen permisos para leer archivos o escribir en `import_folder`.
+    :return None: No retorna ningún valor.
+    """
     subfolders_pairs = [("test", "Test"), ("train", "Train"), ("valid", "Validation")]
     for sub, folder in subfolders_pairs:
         label_subdir = os.path.join(labels_path, sub)
+        import_subdir = os.path.join(import_folder, sub)
         label_files = [f for f in os.listdir(label_subdir) if f.endswith(".txt")]
         images_files = [os.path.splitext(f)[0] + ".jpg" for f in label_files]
-        
+                
         # Copiar todos los archivos txt al nuevo directorio
-        import_label_subdir = os.path.join(import_folder, sub, "labels", folder)
+        import_label_subdir = os.path.join(import_subdir, "labels", folder)
         os.makedirs(import_label_subdir, exist_ok=True)
         for label_file in label_files:
             source_path = os.path.join(label_subdir, label_file)
@@ -545,20 +598,23 @@ def crear_import(labels_path: str, import_folder: str):
             shutil.copy2(source_path, dest_path)  # copy2 preserva metadatos
 
         # Crear el archivo {task}.txt
-        task_file = os.path.join(import_folder, sub, f"{folder}.txt")
+        task_file = os.path.join(import_subdir, f"{folder}.txt")
         with open(task_file, 'w') as file:
             for image_name in images_files:
                 line = f"data/images/{folder}/{image_name}"
                 file.write(line + "\n")
         
         # Crear el archivo data.yaml
-        yaml_file = os.path.join(import_folder, sub, "data.yaml")
+        yaml_file = os.path.join(import_subdir, "data.yaml")
         with open(yaml_file, 'w') as file:
             file.write(f"{folder}: {folder}.txt\n")
             file.write("names:\n")
             for i, class_name in enumerate(CLASSES):
                 file.write(f"  {i}: {class_name}\n")
             file.write("path: .\n")
+
+        # Guardar todo en un zip listo para usar
+        folder_to_zip(import_subdir)
 
 
 # ? Convertir dataset CVAT a formato YOLO
@@ -643,11 +699,9 @@ if __name__ == "__main__":
     images_path = "salmones/images"
     import_folder = "salmones/import"
 
-    #start = timer()  # Invocar la función para obtener el tiempo inicial
-    #convertir_xml(xml_path, yolo_path)
-    #end = timer()    # Invocar la función para obtener el tiempo final
-    #print(f"Tiempo de ejecución: {end - start:.2f} segundos")
-    #filtrar_dataset(yolo_path, filtered_path, images_path, True, True)
-
+    start = timer()  # Invocar la función para obtener el tiempo inicial
+    convertir_xml(xml_path, yolo_path)
+    filtrar_dataset(yolo_path, filtered_path, images_path, True, True)
     crear_import(filtered_path, import_folder)
-    
+    end = timer()    # Invocar la función para obtener el tiempo final
+    print(f"Tiempo de ejecución: {end - start:.2f} segundos")
