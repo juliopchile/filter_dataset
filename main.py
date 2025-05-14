@@ -1,6 +1,8 @@
 import os
+import glob
 import shutil
 import zipfile
+import random
 import xml.etree.ElementTree as ET
 import cv2
 import numba
@@ -10,13 +12,18 @@ from cv2.typing import MatLike
 from collections.abc import Callable
 from typing import List, Dict, Tuple, Optional, Literal
 from timeit import default_timer as timer
-
+#np.set_printoptions(suppress=True)
 
 SALMON = 0
 MEDIUM = 1
 SMALL = 2
-FUZZY = 3
-CLASSES = ["salmon", "medium", "small", "fuzzy"]  # index 0 -> 'salmon'
+TINY = 3
+FUZZY = 4
+CLASSES = ["salmon", "medium", "small", "tiny", "fuzzy"]  # index 0 -> 'salmon'
+#CLASSES = ["salmon"]
+
+RATIOS = {'train': 1, 'valid': 0, 'test': 0}
+SEED = 201721022
 
 # ?
 # ? Métricas de las máscaras
@@ -315,7 +322,7 @@ def save_yolo_segmentation(segmentations: List[Dict[str, int | NDArray[np.float3
             class_id = seg['class_id']
             points: NDArray[np.float32] = seg['points']  # Array de forma (N, 2)
             # Convertir el array a una lista plana de coordenadas [x1, y1, x2, y2, ...]
-            coords = [f"{coord:.6f}" for coord in points.flatten()]
+            coords = [f"{coord}" for coord in points.flatten()]
             # Construir la línea: clase seguida de coordenadas
             line = " ".join([str(class_id)] + coords)
             file.write(line + "\n")
@@ -399,29 +406,31 @@ def desicion_making(metricas: Dict[str, float]) -> Literal[3, 1, 2, 0]:
     # Calcular métricas
     area = metricas["area"]
     perimeter = metricas["perimeter"]
-    aspect_ratio = metricas["aspect_ratio"]
-    nitidez = metricas["nitidez"]
+    #aspect_ratio = metricas["aspect_ratio"]
+    #nitidez = metricas["nitidez"]
 
-    # Area pequeña
-    if area <= 3950:
-        if nitidez <= 1.3:
-            return FUZZY
-        elif (nitidez >= 1.7) and (perimeter >= 300):
+    #if nitidez < 1.2:
+    #    return FUZZY
+    # Área minuscula
+    if area <= 1700:
+        #if nitidez >= 1.5 and perimeter >= 255:
+        if perimeter >= 255:
+            return SMALL
+        else:
+            return TINY
+    # Área pequeña
+    elif 1700 < area <= 4200:
+        #if nitidez >= 1.65 and perimeter >= 400:
+        if perimeter >= 425:
             return MEDIUM
         else:
             return SMALL
-    # Area mediana
-    elif 3950 < area <= 6500:   
-        if nitidez <= 1.2:
-            return FUZZY
-        else:
-            return MEDIUM
+    # Área mediana
+    elif 4200 < area <= 7500:   
+        return MEDIUM
     # Ariana grande
     else:
-        if (nitidez < 1) and (aspect_ratio <= 0.15):
-            return FUZZY
-        else:
-            return SALMON
+        return SALMON
 
 def procesar_poligonos(segmentations: List[Dict[str, int | NDArray[np.float32]]], img_height: int, img_width: int, peso_borde: float = 0.5,
                        image: MatLike = None, ksizes: Tuple[int, int, int] = (-1, None, 5), include: bool = False) -> List[Dict[str, int | NDArray[np.float32]]]:
@@ -437,7 +446,8 @@ def procesar_poligonos(segmentations: List[Dict[str, int | NDArray[np.float32]]]
     Tiene formato [{'class_id': int, 'points': NDArray[np.float32] de forma (N, 2)}, ...].
     """
     nuevos_poligonos = []
-    metric_name_list = ["area", "perimeter", "aspect_ratio", "nitidez"]
+    #metric_name_list = ["area", "perimeter", "aspect_ratio", "nitidez"]
+    metric_name_list = ["area", "perimeter"]
 
     # En caso de querer calcularse la nitidez, es necesario pasar la imagen original.
     if image is not None:
@@ -456,6 +466,7 @@ def procesar_poligonos(segmentations: List[Dict[str, int | NDArray[np.float32]]]
         gradientes = grad_mag, laplaciano_mag
     else:
         gradientes = None
+        ksize_band = None
 
     # Iterar por cada etiqueta de este archivo de etiquetas.
     for seg in segmentations:
@@ -464,11 +475,14 @@ def procesar_poligonos(segmentations: List[Dict[str, int | NDArray[np.float32]]]
         metricas = calc_metrics_single_polygon(polygon, metric_name_list, peso_borde, ksize_band, gradientes)
         score = desicion_making(metricas)
 
+        #if score in (MEDIUM, SMALL) and seg['class_id'] == FUZZY:
+        #    score = FUZZY
+
         # Decidir si añadir casos como otra clase o simplemente filtrarlos
         if include:
             nuevos_poligonos.append({'class_id': score, 'points': points})
         else:
-            if score == 0:
+            if score == SALMON or score == MEDIUM:
                 nuevos_poligonos.append(seg)
 
     return nuevos_poligonos     
@@ -573,67 +587,100 @@ def folder_to_zip(folder_path: str) -> None:
     
     print(f"Carpeta '{folder_path}' comprimida en '{final_zip_path}' y eliminada.")
 
-def crear_import(labels_path: str, import_folder: str) -> None:
-    """Crea una estructura de directorios y archivos para importar un dataset YOLO a CVAT, y lo comprime en un archivo ZIP.
-
-    :param str labels_path: Directorio que contiene las subcarpetas "test", "train", "valid" con archivos de etiquetas YOLO.
-    :param str import_folder: Directorio donde se creará la estructura de importación.
-    :raises FileNotFoundError: Si `labels_path` o sus subcarpetas no existen.
-    :raises PermissionError: Si no se tienen permisos para leer archivos o escribir en `import_folder`.
-    :return None: No retorna ningún valor.
+def crear_import(labels_path: str, images_path: str, import_folder: str, subfolders_pairs=None) -> None:
     """
-    subfolders_pairs = [("test", "Test"), ("train", "Train"), ("valid", "Validation")]
+    Crea la estructura para importar un dataset YOLO a CVAT,
+    copiando etiquetas y asociando imágenes de cualquier extensión.
+
+    :param labels_path: Carpeta con subcarpetas 'test', 'train', 'valid' de .txt
+    :param images_path: Carpeta con subcarpetas 'test', 'train', 'valid' de imágenes
+    :param import_folder: Carpeta destino donde se crea la estructura y ZIP
+    :param subfolders_pairs: Lista de tuples ("etiqueta", "NombreTask")
+    """
+    if subfolders_pairs is None:
+        subfolders_pairs = [("test", "Test"), ("train", "Train"), ("valid", "Validation")]
+
+    # Validación de existencia
+    for sub, _ in subfolders_pairs:
+        lp = os.path.join(labels_path, sub)
+        ip = os.path.join(images_path, sub)
+        if not os.path.isdir(lp):
+            raise FileNotFoundError(f"No existe labels: {lp}")
+        if not os.path.isdir(ip):
+            raise FileNotFoundError(f"No existe imágenes: {ip}")
+
+    # Procesar cada partición
     for sub, folder in subfolders_pairs:
         label_subdir = os.path.join(labels_path, sub)
+        image_subdir = os.path.join(images_path, sub)
         import_subdir = os.path.join(import_folder, sub)
-        label_files = [f for f in os.listdir(label_subdir) if f.endswith(".txt")]
-        images_files = [os.path.splitext(f)[0] + ".jpg" for f in label_files]
-                
-        # Copiar todos los archivos txt al nuevo directorio
-        import_label_subdir = os.path.join(import_subdir, "labels", folder)
-        os.makedirs(import_label_subdir, exist_ok=True)
-        for label_file in label_files:
-            source_path = os.path.join(label_subdir, label_file)
-            dest_path = os.path.join(import_label_subdir, label_file)
-            shutil.copy2(source_path, dest_path)  # copy2 preserva metadatos
 
-        # Crear el archivo {task}.txt
+        # Crear carpetas destino
+        labels_dest = os.path.join(import_subdir, "labels", folder)
+        images_dest = os.path.join(import_subdir, "images", folder)
+        os.makedirs(labels_dest, exist_ok=True)
+        os.makedirs(images_dest, exist_ok=True)
+
+        # Para cada archivo .txt buscar su imagen asociada
+        task_list = []
+        for label_file in os.listdir(label_subdir):
+            if not label_file.lower().endswith('.txt'):
+                continue
+            base = os.path.splitext(label_file)[0]
+            # copiar etiqueta
+            src_label = os.path.join(label_subdir, label_file)
+            dst_label = os.path.join(labels_dest, label_file)
+            shutil.copy2(src_label, dst_label)
+
+            # buscar imagen en cualquier extensión
+            pattern = os.path.join(image_subdir, base + '.*')
+            matches = glob.glob(pattern)
+            if not matches:
+                print(f"Advertencia: imagen no encontrada para {base} en {image_subdir}")
+                continue
+            # tomar la primera coincidencia
+            img_path = matches[0]
+            img_name = os.path.basename(img_path)
+            shutil.copy2(img_path, os.path.join(images_dest, img_name))
+            task_list.append(f"data/images/{folder}/{img_name}")
+
+        # escribir archivo de tarea
         task_file = os.path.join(import_subdir, f"{folder}.txt")
-        with open(task_file, 'w') as file:
-            for image_name in images_files:
-                line = f"data/images/{folder}/{image_name}"
-                file.write(line + "\n")
-        
-        # Crear el archivo data.yaml
-        yaml_file = os.path.join(import_subdir, "data.yaml")
-        with open(yaml_file, 'w') as file:
-            file.write(f"{folder}: {folder}.txt\n")
-            file.write("names:\n")
-            for i, class_name in enumerate(CLASSES):
-                file.write(f"  {i}: {class_name}\n")
-            file.write("path: .\n")
+        with open(task_file, 'w') as f:
+            for line in task_list:
+                f.write(line + '\n')
 
-        # Guardar todo en un zip listo para usar
+        # escribir data.yaml
+        yaml_file = os.path.join(import_subdir, "data.yaml")
+        with open(yaml_file, 'w') as f:
+            f.write(f"{folder}: {folder}.txt\n")
+            f.write("names:\n")
+            for i, cls in enumerate(CLASSES):
+                f.write(f"  {i}: {cls}\n")
+            f.write("path: .\n")
+
+        # comprimir
         folder_to_zip(import_subdir)
 
-
+# ?
 # ? Convertir dataset CVAT a formato YOLO
-def normalize_polygon(points: List[Tuple[float, float]], img_w: int, img_h: int) -> List[float]:
+# ?
+def normalize_polygon(points: List[Tuple[float, float]], img_w: float, img_h: float) -> List[float]:
     """Normaliza las coordenadas de las etiquetas según el tamaño de imagen, en el rango [0, 1].
 
     :param List[Tuple[float, float]] points: Recibe puntos como lista de tuplas [(x1, y1), ..., (xn, yn)].
-    :param int img_w: Ancho de la imagen.
-    :param int img_h: Alto de la imagen.
-    :return List[float]: Devuelve una lista con valores [x_norm_i, y_norm_i].
+    :param float img_w: Ancho de la imagen.
+    :param float img_h: Alto de la imagen.
+    :return List[float]: Devuelve una lista con valores [x_norm_1, y_norm_1, ..., x_norm_n, y_norm_n].
     """
-    puntos_a_retornar = []
+    normalized_points = []
     for x, y in points:
-        puntos_a_retornar.append(str(x/img_w))
-        puntos_a_retornar.append(str(y/img_h))
-    return puntos_a_retornar
+        normalized_points.append(x / img_w)
+        normalized_points.append(y / img_h)
+    return normalized_points
 
-def parse_and_convert(xml_path: str, output_dir: str):
-    """Esta función lee un archivo XML con etiquetas de segmentación y las guarda en formato YOLO de segmetnación.
+def parse_and_convert_segmentations(xml_path: str, output_dir: str):
+    """Esta función lee un archivo XML con etiquetas de segmentación y las guarda en formato YOLO de segmentación usando save_yolo_segmentation.
 
     :param str xml_path: Dirección del archivo XML con el dataset en formato CVAT.
     :param str output_dir: Directorio donde guardar las etiquetas en formato YOLO.
@@ -642,12 +689,12 @@ def parse_and_convert(xml_path: str, output_dir: str):
     tree = ET.parse(xml_path)
     root = tree.getroot()
 
-    # Crear carpeta donde guardar los archivos en formato YOLO.
+    # Crear carpeta donde guardar los archivos en formato YOLO
     os.makedirs(output_dir, exist_ok=True)
-     
-    # Recorrer para todas las imagenes del dataset
+
+    # Recorrer todas las imágenes del dataset
     for img in root.findall('image'):
-        # Saltarse imagenes sin etiquetas
+        # Saltarse imágenes sin etiquetas
         polygons = img.findall('polygon')
         if not polygons:
             continue
@@ -659,26 +706,147 @@ def parse_and_convert(xml_path: str, output_dir: str):
         img_w = float(img.get('width'))
         img_h = float(img.get('height'))
 
-        # Escribir las etiquetas
-        with open(label_file, 'w') as out_f:
-            for poly in polygons:
-                pts_str = poly.get('points')  # "x1,y1;x2,y2;..."
-                # Parsear puntos
-                pts = []
-                for pair in pts_str.split(';'):
-                    x_str, y_str = pair.split(',')
-                    pts.append((float(x_str), float(y_str)))
-                # Normalizar coordenadas de polígonos entre [0, 1]
-                norm_pts = normalize_polygon(pts, img_w, img_h)
-                # Construir la línea YOLO: class_id + espacio + coords separados por espacios
-                class_name = poly.get('label')
-                class_id = CLASSES.index(class_name)
-                line = f"{class_id} " + " ".join(norm_pts)
-                # Guardar la línea en el archivo
-                out_f.write(line + "\n")
+        # Lista para almacenar las segmentaciones de esta imagen
+        segmentations: List[Dict[str, int | NDArray[np.float32]]] = []
 
-def convertir_xml(labels_path: str, output_dir: str):
-    """Convierte un dataset en formato CVAT1.1 al formato YOLO segmentación
+        # Procesar cada polígono
+        for poly in polygons:
+            pts_str = poly.get('points')  # "x1,y1;x2,y2;..."
+            # Parsear puntos
+            pts = []
+            for pair in pts_str.split(';'):
+                x_str, y_str = pair.split(',')
+                pts.append((float(x_str), float(y_str)))
+            # Normalizar coordenadas de polígonos entre [0, 1]
+            normalized_points = normalize_polygon(pts, img_w, img_h)
+            # Convertir a NDArray[np.float32] de forma (N, 2)
+            points_array = np.array(normalized_points).reshape(-1, 2).astype(np.float32)
+            # Obtener class_id
+            class_name = poly.get('label')
+            class_id = CLASSES.index(class_name)
+            # Crear diccionario para la segmentación
+            seg = {'class_id': class_id, 'points': points_array}
+            # Agregar a la lista de segmentaciones
+            segmentations.append(seg)
+
+        # Guardar las segmentaciones usando save_yolo_segmentation
+        save_yolo_segmentation(segmentations, label_file)
+
+def split_files(files: List[str], output_dir: str) -> Dict[str, List[str]]:
+    """Divide una lista de archivos en tres listas según RATIOS."""
+    random.seed(SEED)
+    files_sorted = sorted(files)
+    random.shuffle(files_sorted)
+    total = len(files_sorted)
+    n_train = int(total * RATIOS['train'])
+    n_valid = int(total * RATIOS['valid'])
+    train = files_sorted[:n_train]
+    valid = files_sorted[n_train:n_train + n_valid]
+    test = files_sorted[n_train + n_valid:]
+    # Crear directorios
+    splits = {'train': train, 'valid': valid, 'test': test}
+    for split in splits:
+        os.makedirs(os.path.join(output_dir, split), exist_ok=True)
+    return splits
+
+def parse_and_convert_tracking_with_split(xml_path: str, output_dir: str, video_path: str = None, imgs_dir: str = None) -> None:
+    """
+    Convierte anotaciones CVAT a YOLO y extrae imágenes,
+    luego divide ambos (etiquetas e imágenes) en train/valid/test.
+    """
+    # Directorio plano temporal
+    temp_labels = os.path.join(output_dir, 'all_labels')
+    os.makedirs(temp_labels, exist_ok=True)
+    if video_path and imgs_dir:
+        temp_imgs = os.path.join(imgs_dir, 'all_images')
+        os.makedirs(temp_imgs, exist_ok=True)
+    else:
+        temp_imgs = None
+
+    # Parse XML
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+    meta = root.find('meta')
+    original = meta.find('original_size') or meta.find('job/original_size') or  meta.find('task/original_size')
+    width = float(original.find('width').text)
+    height = float(original.find('height').text)
+
+    # Acumular segmentaciones por frame
+    frames_dict: Dict[int, List[Dict[str, np.ndarray]]] = {}
+    for track in root.findall('track'):
+        class_name = track.get('label')
+        if class_name not in CLASSES:
+            continue
+        class_id = CLASSES.index(class_name)
+        for poly in track.findall('polygon'):
+            outside = int(poly.get('outside'))
+            if outside == 0:
+                frame = int(poly.get('frame'))
+                pts = [(float(x), float(y)) for x, y in
+                       (p.split(',') for p in poly.get('points').split(';'))]
+                norm = normalize_polygon(pts, width, height)
+                pts_arr = np.array(norm, dtype=np.float32).reshape(-1, 2)
+                seg = {'class_id': class_id, 'points': pts_arr}
+                frames_dict.setdefault(frame, []).append(seg)
+
+    video_name = os.path.splitext(os.path.basename(video_path))[0] if video_path else 'frame'
+
+    # Guardar todas las etiquetas en carpeta plana
+    for frame, segs in frames_dict.items():
+        label_file = os.path.join(temp_labels, f"{video_name}_{frame:06d}.txt")
+        save_yolo_segmentation(segs, label_file)
+
+    # Extraer y guardar todas las imágenes en carpeta plana
+    #if video_path and temp_imgs:
+    #    cap = cv2.VideoCapture(video_path)
+    #    if not cap.isOpened():
+    #        raise IOError(f"No se pudo abrir video: {video_path}")
+    #    for frame in sorted(frames_dict.keys()):
+    #        cap.set(cv2.CAP_PROP_POS_FRAMES, frame)
+    #        ret, img = cap.read()
+    #        if not ret:
+    #            print(f"No se pudo leer frame {frame}")
+    #            continue
+    #        img_file = os.path.join(temp_imgs, f"{video_name}_{frame:06d}.png")
+    #        cv2.imwrite(img_file, img)
+    #    cap.release()
+
+    if video_path and temp_imgs:
+        cmd = (
+            f'ffmpeg -i "{video_path}" '
+            f'-start_number 0 "{os.path.join(temp_imgs, video_name)}_%06d.png" '
+            f'-hide_banner -loglevel error'
+        )
+        os.system(cmd)
+        print(f"Convertido video completo a imágenes en: {temp_imgs}")
+
+    # Obtener listas de archivos y dividir
+    label_files = [os.path.join(temp_labels, f) for f in os.listdir(temp_labels) if f.endswith('.txt')]
+    splits_labels = split_files(label_files, output_dir)
+
+    if temp_imgs:
+        img_files = [os.path.join(temp_imgs, f) for f in os.listdir(temp_imgs) if f.endswith('.png')]
+        splits_imgs = split_files(img_files, imgs_dir)
+    else:
+        splits_imgs = {}
+
+    # Mover archivos a sus carpetas finales
+    for split, files in splits_labels.items():
+        for src in files:
+            dst = os.path.join(output_dir, split, os.path.basename(src))
+            shutil.move(src, dst)
+    for split, files in splits_imgs.items():
+        for src in files:
+            dst = os.path.join(imgs_dir, split, os.path.basename(src))
+            shutil.move(src, dst)
+
+    # Opcional: eliminar carpetas planas si ya no se necesitan
+    shutil.rmtree(temp_labels)
+    if temp_imgs:
+        shutil.rmtree(temp_imgs)
+
+def convert_xml_images(labels_path: str, output_dir: str):
+    """Convierte un dataset en formato CVAT1.1 para imagenes al formato YOLO segmentación
 
     :param str labels_path: Direcotrio de las etiquetas en formato CVAT.
     :param str output_dir: Directorio donde guardar las etiquetas en formato YOLO.
@@ -690,18 +858,161 @@ def convertir_xml(labels_path: str, output_dir: str):
         xml_file = os.path.join(label_subdir, "annotations.xml")
         if not os.path.isfile(xml_file):
             continue
-        parse_and_convert(xml_file, out_label_subdir)
+        parse_and_convert_segmentations(xml_file, out_label_subdir)
+
+def convert_xml_video(labels_path: str, output_dir: str, video_path: str = None, video_store_path: str = None):
+    """Convierte un dataset en formato CVAT1.1 para vide tracking o al formato YOLO segmentación
+
+    :param str labels_path: Directorio de las etiquetas en formato CVAT.
+    :param str output_dir: Directorio donde guardar las etiquetas en formato YOLO.
+    :param str video_path (opcional): Arhivo de video a procesar.
+    """
+    xml_file = os.path.join(labels_path, "annotations.xml")
+    parse_and_convert_tracking_with_split(xml_file, output_dir, video_path, video_store_path)
+
+def simplest_filter(labels_path: str, filter_out_classes: List[int]):
+    subfolders = ["test", "train", "valid"]
+
+    for sub in subfolders:
+        label_subdir = os.path.join(labels_path, sub)
+        # Verificar si el subdirectorio existe
+        if not os.path.exists(label_subdir):
+            continue
+   
+        label_files = [f for f in os.listdir(label_subdir) if f.endswith(".txt")]
+
+        for file in label_files:
+            file_path = os.path.join(label_subdir, file)
+            # Leer el archivo original
+            with open(file_path, 'r') as f:
+                lines = f.readlines()
+
+            # Filtrar líneas y modificar clases
+            new_lines = []
+            for line in lines:
+                # Obtener el class_id (primer número de la línea)
+                parts = line.strip().split()
+                if not parts:  # Saltar líneas vacías
+                    continue
+                class_id = int(parts[0])
+
+                # Saltar líneas que correspondan a clases que queremos filtrar
+                if class_id in filter_out_classes:
+                    continue
+
+                # Cambiar el class_id a 0 y mantener el resto de la línea
+                parts[0] = '0'
+                new_lines.append(' '.join(parts) + '\n')
+
+            if len(new_lines) > 0:
+                # Escribir el archivo modificado
+                with open(file_path, 'w') as f:
+                    f.writelines(new_lines)
+            else:
+                # Borrar el archivo si no hay líneas válidas
+                os.remove(file_path)
+
+def split_yolo_dataset(dataset_dir, seed=None, image_exts=('jpg', 'jpeg', 'png', 'bmp'), label_ext='txt'):
+    """
+    Split a YOLO-format instance segmentation dataset into train, test, and valid subsets.
+
+    Args:
+        dataset_dir (str): Root directory containing 'images/full' and 'labels/full'.
+        ratios (tuple of float): Ratios for train, test, valid splits. Must sum to 1.0.
+        seed (int, optional): Random seed for reproducibility.
+        image_exts (tuple of str): Allowed image file extensions (without dot).
+        label_ext (str): Extension for label files (without dot).
+
+    Result:
+        Creates 'images/train', 'images/test', 'images/valid' and corresponding
+        'labels/train', 'labels/test', 'labels/valid' directories and copies files.
+    """
+    # Directories
+    images_full = os.path.join(dataset_dir, 'images', 'full')
+    labels_full = os.path.join(dataset_dir, 'labels', 'full')
+    ratios=(0.65, 0.05, 0.30)
+
+    # Validate directories exist
+    if not os.path.isdir(images_full) or not os.path.isdir(labels_full):
+        raise ValueError(f"Expected dirs 'images/full' and 'labels/full' under {dataset_dir}")
+
+    # Gather all labeled images
+    labeled_images = []
+    for lbl_name in os.listdir(labels_full):
+        if not lbl_name.endswith(f'.{label_ext}'):
+            continue
+        stem = os.path.splitext(lbl_name)[0]
+        lbl_path = os.path.join(labels_full, lbl_name)
+        # Find corresponding image
+        for ext in image_exts:
+            img_name = f"{stem}.{ext}"
+            img_path = os.path.join(images_full, img_name)
+            if os.path.exists(img_path):
+                labeled_images.append((img_path, lbl_path))
+                break
+
+    if not labeled_images:
+        print("No labeled images found. Nothing to split.")
+        return
+
+    # Shuffle
+    if seed is not None:
+        random.seed(seed)
+    random.shuffle(labeled_images)
+
+    # Check ratios
+    if len(ratios) != 3 or abs(sum(ratios) - 1.0) > 1e-6:
+        raise ValueError("Ratios must be a tuple of three floats summing to 1.0")
+    r_train, r_test, r_valid = ratios
+
+    n = len(labeled_images)
+    n_train = int(n * r_train)
+    n_test = int(n * r_test)
+    n_valid = n - n_train - n_test
+
+    splits = {
+        'train': labeled_images[:n_train],
+        'test': labeled_images[n_train:n_train + n_test],
+        'valid': labeled_images[n_train + n_test:],
+    }
+
+    # Create output dirs and copy files
+    for split, items in splits.items():
+        img_out_dir = os.path.join(dataset_dir, 'images', split)
+        lbl_out_dir = os.path.join(dataset_dir, 'labels', split)
+        os.makedirs(img_out_dir, exist_ok=True)
+        os.makedirs(lbl_out_dir, exist_ok=True)
+
+        for img_path, lbl_path in items:
+            shutil.copy2(img_path, os.path.join(img_out_dir, os.path.basename(img_path)))
+            shutil.copy2(lbl_path, os.path.join(lbl_out_dir, os.path.basename(lbl_path)))
+
+        print(f"Copied {len(items)} items to {split}")
+
+    print("Dataset split complete.")
 
 if __name__ == "__main__":
-    xml_path = "salmones2025/labels"
-    yolo_path = "salmones/labels"
-    filtered_path = "salmones/filtered"
-    images_path = "salmones/images"
-    import_folder = "salmones/import"
+    videos = ["Seguimiento_1", "Seguimiento_2"]
 
-    start = timer()  # Invocar la función para obtener el tiempo inicial
-    convertir_xml(xml_path, yolo_path)
-    filtrar_dataset(yolo_path, filtered_path, images_path, True, True)
-    crear_import(filtered_path, import_folder)
-    end = timer()    # Invocar la función para obtener el tiempo final
-    print(f"Tiempo de ejecución: {end - start:.2f} segundos")
+    for video in videos:
+        xml_path = os.path.join("xml_files", f"{video}")
+        yolo_path = os.path.join("salmones", f"labels_{video}")
+        filtered_path = os.path.join("salmones", f"labels_{video}_filetered")
+        import_folder = os.path.join("salmones", f"import_{video}")
+        images_path = "salmones/images"
+        video_path = os.path.join("videos", f"{video}.mp4")
+        video_store_path = os.path.join("salmones", f"{video}")
+
+        subfolder_pairs = [("test", "Test"), ("train", "Train"), ("valid", "Validation")]
+
+        #start = timer()  # Invocar la función para obtener el tiempo inicial
+        #convert_xml_images(xml_path, yolo_path)
+        #convert_xml_video(xml_path, yolo_path, video_path, video_store_path)
+        #filtrar_dataset(yolo_path, filtered_path, images_path, False, False)
+        #split_yolo_dataset(video_store_path)
+        #crear_import("SalmonesV5_Complete/labels", "SalmonesV5_Complete/images", "SalmonesV5_Complete/import", subfolder_pairs)
+        #end = timer()    # Invocar la función para obtener el tiempo final
+        #print(f"Tiempo de ejecución: {end - start:.2f} segundos")
+
+        #filter_out_classes = [2, 3, 4]
+        #simplest_filter(yolo_path, filter_out_classes)
