@@ -861,7 +861,7 @@ def convert_xml_images(labels_path: str, output_dir: str):
         parse_and_convert_segmentations(xml_file, out_label_subdir)
 
 def convert_xml_video(labels_path: str, output_dir: str, video_path: str = None, video_store_path: str = None):
-    """Convierte un dataset en formato CVAT1.1 para vide tracking o al formato YOLO segmentación
+    """Convierte un dataset en formato CVAT1.1 para video tracking al formato YOLO segmentación
 
     :param str labels_path: Directorio de las etiquetas en formato CVAT.
     :param str output_dir: Directorio donde guardar las etiquetas en formato YOLO.
