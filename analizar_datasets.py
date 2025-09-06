@@ -65,9 +65,12 @@ def analyze_dataset(images_dir, labels_base_dir, dataset_name):
     return pd.DataFrame(rows, columns=['Dataset', 'Tarea', 'Num. imgs.', 'Num. segm.', 'Img. fondo'])
 
 if __name__ == '__main__':
-    images_dir = "SalmonesV5_Complete/images"
+    images_dir = "salmones/images"
     datasets = {
-        "SalmonesV5": "SalmonesV5_Complete/labels",    
+        "SalmonesV1": "salmones/labelsV1",
+        "SalmonesV2": "salmones/labelsV2",
+        "SalmonesV3": "salmones/labelsV3_pre",
+        "SalmonesV4": "salmones/labelsV4_pre"
     }
 
     all_reports = []
